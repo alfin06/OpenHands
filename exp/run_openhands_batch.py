@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 Batch Patch Generator using OpenHands SDK v1.34.0 (CodeActAgent).
-Registers workspace tools (terminal, file_editor), iterates over SWE issue
-artifacts, executes the agent, and writes `generated_patch.diff` and `openhands_run.log`.
+Registers workspace tools (terminal, file_editor), iterates over issue
+artifacts, executes the agent, and writes `generated_patch.diff`, `cost.json`,
+and `openhands_run.log`.
 
 Run the script:
 python exp/run_openhands_batch.py --artifacts-dir /root/OpenHands/artifacts --output-dir /root/OpenHands/patches --max-iterations 60
@@ -34,6 +35,13 @@ from openhands.tools import register_default_tools
 # Register tools once globally
 register_default_tools()
 
+# Fixed GPT-4.1-mini rate card ($ / token)
+RATES = {
+    "uncached_in": 0.40 / 1_000_000,
+    "cached_in": 0.10 / 1_000_000,
+    "out": 1.60 / 1_000_000,
+}
+
 
 def run_cmd(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
@@ -43,6 +51,23 @@ def run_cmd(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProc
         text=True,
         capture_output=True,
     )
+
+
+def extract_val(obj, *keys) -> int:
+    """Safely extracts integer token counts from either dictionaries or objects."""
+    if not obj:
+        return 0
+    for key in keys:
+        if isinstance(obj, dict):
+            val = obj.get(key)
+        else:
+            val = getattr(obj, key, None)
+        if val is not None:
+            try:
+                return int(val)
+            except (ValueError, TypeError):
+                continue
+    return 0
 
 
 async def solve_single_issue(
@@ -83,6 +108,7 @@ async def solve_single_issue(
     patch_target_dir.mkdir(parents=True, exist_ok=True)
     patch_file_path = patch_target_dir / "generated_patch.diff"
     log_file_path = patch_target_dir / "openhands_run.log"
+    cost_file_path = patch_target_dir / "cost.json"
 
     workspace_path = repos_cache_dir / f"openhands_ws_{issue_num}"
     if workspace_path.exists():
@@ -106,7 +132,6 @@ async def solve_single_issue(
 
         llm = LLM(**llm_kwargs)
 
-        # Select only repo-manipulation tools
         coding_tools = [
             Tool(name="terminal", params={}),
             Tool(name="file_editor", params={}),
@@ -140,7 +165,69 @@ async def solve_single_issue(
         conversation.send_message(msg)
         await conversation.arun()
 
-        # 5. Extract Detailed Execution Log from State Events
+        # 5. Extract Metrics & Save cost.json
+        metrics = None
+        if hasattr(conversation, "conversation_stats") and conversation.conversation_stats:
+            try:
+                metrics = conversation.conversation_stats.get_combined_metrics()
+            except Exception:
+                metrics = None
+        elif hasattr(llm, "metrics") and llm.metrics:
+            metrics = llm.metrics
+
+        input_tokens = 0
+        output_tokens = 0
+        cached_tokens = 0
+
+        # Attempt A: Aggregate usage object
+        if metrics and getattr(metrics, "accumulated_token_usage", None):
+            u = metrics.accumulated_token_usage
+            input_tokens = extract_val(u, "prompt_tokens", "input_tokens")
+            output_tokens = extract_val(u, "completion_tokens", "output_tokens")
+            cached_tokens = extract_val(u, "cache_read_tokens", "cache_read_input_tokens")
+
+        # Attempt B: Fallback to iterating state events
+        if input_tokens == 0 and hasattr(conversation, "state") and hasattr(conversation.state, "events"):
+            for event in conversation.state.events:
+                usage = (
+                    getattr(event, "usage", None)
+                    or getattr(getattr(event, "response", None), "usage", None)
+                )
+                if usage:
+                    input_tokens += extract_val(usage, "prompt_tokens", "input_tokens")
+                    output_tokens += extract_val(usage, "completion_tokens", "output_tokens")
+
+                    # Handle cached tokens both flat and inside prompt_tokens_details
+                    cached = extract_val(usage, "cache_read_tokens", "cache_read_input_tokens")
+                    if not cached:
+                        details = (
+                            usage.get("prompt_tokens_details")
+                            if isinstance(usage, dict)
+                            else getattr(usage, "prompt_tokens_details", None)
+                        )
+                        cached = extract_val(details, "cached_tokens")
+                    cached_tokens += cached
+
+        uncached_in = max(0, input_tokens - cached_tokens)
+        cost_usd = (
+            (uncached_in * RATES["uncached_in"])
+            + (cached_tokens * RATES["cached_in"])
+            + (output_tokens * RATES["out"])
+        )
+
+        cost_data = {
+            "instance_id": issue_folder,
+            "input_tokens": input_tokens,
+            "cached_tokens": cached_tokens,
+            "uncached_tokens": uncached_in,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "cost_usd": round(cost_usd, 6),
+        }
+        cost_file_path.write_text(json.dumps(cost_data, indent=2), encoding="utf-8")
+        print(f"[✓] Saved cost.json: ${cost_usd:.4f} ({input_tokens} in [cached: {cached_tokens}], {output_tokens} out)")
+
+        # 6. Extract Detailed Execution Log from State Events
         log_lines = []
         if hasattr(conversation, "state") and hasattr(conversation.state, "events"):
             for event in conversation.state.events:
@@ -149,7 +236,8 @@ async def solve_single_issue(
             log_lines.append(str(conversation))
         log_file_path.write_text("\n".join(log_lines), encoding="utf-8")
 
-        # 6. Extract Git Diff
+        # 7. Extract Git Diff (including newly created files)
+        run_cmd(["git", "add", "-A", "--intent-to-add"], cwd=workspace_path)
         diff_res = run_cmd(["git", "diff"], cwd=workspace_path)
         patch_text = diff_res.stdout
 
