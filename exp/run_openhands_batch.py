@@ -96,7 +96,7 @@ from openhands.tools import register_default_tools
 # Register tools once globally
 register_default_tools()
 
-# GPT-4.1-mini rate card ($ / token)
+# Rate cards ($ / token)
 MODEL_RATE_CARDS = {
     "gpt-4.1-mini": {
         "uncached_in": 0.40 / 1_000_000,
@@ -172,7 +172,7 @@ async def solve_single_issue(
     print(f"[*] Processing Artifact: {issue_folder}")
     print("=" * 60)
 
-    # 1. Parse Issue Metadata
+    # Parse Issue Metadata
     json_files = sorted(list(artifact_dir.glob("issue_*.json"))) or sorted(list(artifact_dir.glob("*.json")))
     if not json_files:
         print(f"[-] No issue JSON found in {artifact_dir}. Skipping.")
@@ -203,7 +203,7 @@ async def solve_single_issue(
         shutil.rmtree(workspace_path)
 
     try:
-        # 2. Clone and checkout base buggy commit
+        # Clone and checkout base buggy commit
         print(f"[*] Cloning {repo_url} at base commit {base_sha}...")
         clone_res = run_cmd(["git", "clone", repo_url, str(workspace_path)])
         if clone_res.returncode != 0:
@@ -213,7 +213,7 @@ async def solve_single_issue(
         if base_sha:
             run_cmd(["git", "checkout", base_sha], cwd=workspace_path)
 
-        # 3. Instantiate LLM & Agent without the browser tool
+        # Instantiate LLM & Agent without the browser tool
         llm_kwargs = {"model": model_name, "api_key": api_key}
         if base_url:
             llm_kwargs["base_url"] = base_url
@@ -229,7 +229,7 @@ async def solve_single_issue(
         agent = Agent(llm=llm, tools=coding_tools)
         workspace = LocalWorkspace(working_dir=workspace_path.resolve())
 
-        # 4. Formulate Prompt & Launch Conversation Loop
+        # Formulate Prompt & Launch Conversation Loop
         instruction = (
             f"You are an expert autonomous software engineer tasked with fixing a bug in this repository.\n\n"
             f"{problem_statement}\n\n"
@@ -253,7 +253,7 @@ async def solve_single_issue(
         conversation.send_message(msg)
         await conversation.arun()
 
-        # 5. Extract Metrics & Save cost.json
+        # Extract Metrics & Save cost.json
         matched_model_key, rates = get_model_rates(model_name)
         metrics = None
         if hasattr(conversation, "conversation_stats") and conversation.conversation_stats:
@@ -268,14 +268,14 @@ async def solve_single_issue(
         output_tokens = 0
         cached_tokens = 0
 
-        # Attempt A: Aggregate usage object
+        # Aggregate usage object
         if metrics and getattr(metrics, "accumulated_token_usage", None):
             u = metrics.accumulated_token_usage
             input_tokens = extract_val(u, "prompt_tokens", "input_tokens")
             output_tokens = extract_val(u, "completion_tokens", "output_tokens")
             cached_tokens = extract_val(u, "cache_read_tokens", "cache_read_input_tokens")
 
-        # Attempt B: Fallback to iterating state events
+        # Fallback to iterating state events
         if input_tokens == 0 and hasattr(conversation, "state") and hasattr(conversation.state, "events"):
             for event in conversation.state.events:
                 usage = (
@@ -318,7 +318,7 @@ async def solve_single_issue(
         cost_file_path.write_text(json.dumps(cost_data, indent=2), encoding="utf-8")
         print(f"[✓] Saved cost.json ({matched_model_key}): ${cost_usd:.4f} ({input_tokens} in [cached: {cached_tokens}], {output_tokens} out)")
 
-        # 6. Extract Detailed Execution Log from State Events
+        # Extract Detailed Execution Log from State Events
         log_lines = []
         if hasattr(conversation, "state") and hasattr(conversation.state, "events"):
             for event in conversation.state.events:
@@ -327,7 +327,7 @@ async def solve_single_issue(
             log_lines.append(str(conversation))
         log_file_path.write_text("\n".join(log_lines), encoding="utf-8")
 
-        # 7. Extract Git Diff (including newly created files)
+        # Extract Git Diff (including newly created files)
         run_cmd(["git", "add", "-A", "--intent-to-add"], cwd=workspace_path)
         diff_res = run_cmd(["git", "diff"], cwd=workspace_path)
         patch_text = diff_res.stdout
