@@ -6,7 +6,7 @@ artifacts, executes the agent, and writes `generated_patch.diff`, `cost.json`,
 and `openhands_run.log`.
 
 Run the script:
-python exp/run_openhands_batch.py --artifacts-dir /root/OpenHands/artifacts --output-dir /root/OpenHands/patches --max-iterations 60
+python exp/run_openhands_batch.py --artifacts-dir /root/OpenHands/artifacts --output-dir /root/OpenHands/patches --model openai/tuzi-gpt-4.1-mini/deepseek-v3.2 --max-iterations 60
 """
 
 import os
@@ -14,12 +14,73 @@ import sys
 import json
 import shutil
 import asyncio
+import warnings
 import subprocess
 import argparse
 from pathlib import Path
 
 # Suppress ASCII banner
 os.environ["OPENHANDS_SUPPRESS_BANNER"] = "1"
+
+# Suppress unmapped model cost calculation warnings from OpenHands telemetry
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    message=r".*Cost calculation failed: This model isn't mapped yet.*",
+)
+
+# Register custom model identifiers into LiteLLM's cost engine
+try:
+    import litellm
+
+    litellm_rates = {
+        # Exact slug queried by OpenHands / LiteLLM telemetry
+        "tuzi-gpt-4.1-mini/deepseek-v3.2": {
+            "input_cost_per_token": 0.28 / 1_000_000,
+            "output_cost_per_token": 0.42 / 1_000_000,
+            "cache_read_input_token_cost": 0.028 / 1_000_000,
+            "litellm_provider": "openai",
+            "mode": "chat",
+        },
+        "openai/tuzi-gpt-4.1-mini/deepseek-v3.2": {
+            "input_cost_per_token": 0.28 / 1_000_000,
+            "output_cost_per_token": 0.42 / 1_000_000,
+            "cache_read_input_token_cost": 0.028 / 1_000_000,
+            "litellm_provider": "openai",
+            "mode": "chat",
+        },
+        "tuzi-gpt-4.1-mini/kimi-k2.5": {
+            "input_cost_per_token": 0.60 / 1_000_000,
+            "output_cost_per_token": 2.50 / 1_000_000,
+            "cache_read_input_token_cost": 0.10 / 1_000_000,
+            "litellm_provider": "openai",
+            "mode": "chat",
+        },
+        "openai/tuzi-gpt-4.1-mini/kimi-k2.5": {
+            "input_cost_per_token": 0.60 / 1_000_000,
+            "output_cost_per_token": 2.50 / 1_000_000,
+            "cache_read_input_token_cost": 0.10 / 1_000_000,
+            "litellm_provider": "openai",
+            "mode": "chat",
+        },
+        "tuzi-gpt-4.1-mini/gpt-4.1-mini": {
+            "input_cost_per_token": 0.40 / 1_000_000,
+            "output_cost_per_token": 1.60 / 1_000_000,
+            "cache_read_input_token_cost": 0.10 / 1_000_000,
+            "litellm_provider": "openai",
+            "mode": "chat",
+        },
+        "openai/tuzi-gpt-4.1-mini/gpt-4.1-mini": {
+            "input_cost_per_token": 0.40 / 1_000_000,
+            "output_cost_per_token": 1.60 / 1_000_000,
+            "cache_read_input_token_cost": 0.10 / 1_000_000,
+            "litellm_provider": "openai",
+            "mode": "chat",
+        },
+    }
+    litellm.register_model(litellm_rates)
+except Exception:
+    pass
 
 from openhands.sdk import (
     LLM,
@@ -35,12 +96,39 @@ from openhands.tools import register_default_tools
 # Register tools once globally
 register_default_tools()
 
-# Fixed GPT-4.1-mini rate card ($ / token)
-RATES = {
-    "uncached_in": 0.40 / 1_000_000,
-    "cached_in": 0.10 / 1_000_000,
-    "out": 1.60 / 1_000_000,
+# GPT-4.1-mini rate card ($ / token)
+MODEL_RATE_CARDS = {
+    "gpt-4.1-mini": {
+        "uncached_in": 0.40 / 1_000_000,
+        "cached_in": 0.10 / 1_000_000,
+        "out": 1.60 / 1_000_000,
+    },
+    "deepseek-v3.2": {
+        "uncached_in": 0.28 / 1_000_000,
+        "cached_in": 0.028 / 1_000_000,
+        "out": 0.42 / 1_000_000,
+    },
+    "kimi-k2.5": {
+        "uncached_in": 0.60 / 1_000_000,
+        "cached_in": 0.10 / 1_000_000,
+        "out": 2.50 / 1_000_000,
+    },
 }
+
+
+def get_model_rates(model_name: str) -> tuple[str, dict]:
+    """Matches the model string to one of the 3 supported rate cards."""
+    name = model_name.lower()
+    if "kimi" in name or "k2.5" in name:
+        return "kimi-k2.5", MODEL_RATE_CARDS["kimi-k2.5"]
+    elif "deepseek" in name or "v3.2" in name:
+        return "deepseek-v3.2", MODEL_RATE_CARDS["deepseek-v3.2"]
+    elif "gpt-4.1-mini" in name or "4.1-mini" in name:
+        return "gpt-4.1-mini", MODEL_RATE_CARDS["gpt-4.1-mini"]
+    else:
+        # Default fallback to gpt-4.1-mini
+        print(f"[!] Warning: Model '{model_name}' unrecognized. Defaulting to 'gpt-4.1-mini' rate card.")
+        return "gpt-4.1-mini", MODEL_RATE_CARDS["gpt-4.1-mini"]
 
 
 def run_cmd(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
@@ -166,6 +254,7 @@ async def solve_single_issue(
         await conversation.arun()
 
         # 5. Extract Metrics & Save cost.json
+        matched_model_key, rates = get_model_rates(model_name)
         metrics = None
         if hasattr(conversation, "conversation_stats") and conversation.conversation_stats:
             try:
@@ -210,13 +299,15 @@ async def solve_single_issue(
 
         uncached_in = max(0, input_tokens - cached_tokens)
         cost_usd = (
-            (uncached_in * RATES["uncached_in"])
-            + (cached_tokens * RATES["cached_in"])
-            + (output_tokens * RATES["out"])
+            (uncached_in * rates["uncached_in"])
+            + (cached_tokens * rates["cached_in"])
+            + (output_tokens * rates["out"])
         )
 
         cost_data = {
             "instance_id": issue_folder,
+            "model": matched_model_key,
+            "raw_model_name": model_name,
             "input_tokens": input_tokens,
             "cached_tokens": cached_tokens,
             "uncached_tokens": uncached_in,
@@ -225,7 +316,7 @@ async def solve_single_issue(
             "cost_usd": round(cost_usd, 6),
         }
         cost_file_path.write_text(json.dumps(cost_data, indent=2), encoding="utf-8")
-        print(f"[✓] Saved cost.json: ${cost_usd:.4f} ({input_tokens} in [cached: {cached_tokens}], {output_tokens} out)")
+        print(f"[✓] Saved cost.json ({matched_model_key}): ${cost_usd:.4f} ({input_tokens} in [cached: {cached_tokens}], {output_tokens} out)")
 
         # 6. Extract Detailed Execution Log from State Events
         log_lines = []
@@ -260,7 +351,7 @@ async def main_async():
     parser.add_argument("--artifacts-dir", type=Path, required=True, help="Directory containing issue artifact folders.")
     parser.add_argument("--output-dir", type=Path, default=Path("./openhands_patches"), help="Output directory for diffs.")
     parser.add_argument("--repos-cache", type=Path, default=Path("./.openhands_cache"), help="Temporary workspace cache.")
-    parser.add_argument("--model", type=str, default=os.getenv("LLM_MODEL", "openai/gpt-4.1-mini"))
+    parser.add_argument("--model", type=str, default=os.getenv("LLM_MODEL", "openai/tuzi-gpt-4.1-mini/deepseek-v3.2"))
     parser.add_argument("--max-iterations", type=int, default=30, help="Max turn iterations per issue.")
     args = parser.parse_args()
 
